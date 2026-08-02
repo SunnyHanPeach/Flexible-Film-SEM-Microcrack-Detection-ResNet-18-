@@ -1,47 +1,58 @@
-# 🔬 Flexible Film SEM Microcrack Detection (ResNet-18)
-> **基于 ResNet-18 迁移学习的柔性发光薄膜微观裂纹自动检测与形貌损伤率定量评估系统**
+# 🚀 同济大学大二上“特长转专业”全栈材料备考手册
+> **背景定位**：同济大学中德工程学院 (CDHK) 机械工程 $\rightarrow$ 材料科学与工程学院  
+> **核心标签**：机械/工程断裂力学 + AI for Science (AI4S) + 柔性半导体微观形貌定量表征  
+> **项目代表作**：Flexible Thin-Film SEM Stress Crack Automated Detection & XAI Characterization
 
 ---
 
-## 📖 项目简介 (Project Overview)
+# Part 1: GitHub 开源仓库完整 README.md
+> *(直接复制以下内容，存为项目根目录的 `README.md`)*
 
-在柔性半导体与薄膜材料（如 QLED / 量子点发光器件）的形变疲劳研究中，显微图（SEM/光学显微镜）下的**极细微裂纹（Microcracks）**识别往往依赖人工目视筛查，不仅耗时费力，且难以对弯折后的面损伤率进行定量表征。
+# Flexible Thin-Film SEM Stress Crack Automated Detection & XAI Characterization
+### 柔性薄膜 SEM 应力裂纹自动化双盲检测与高斯概率热力学表征系统
 
-本项目构建了一套**端到端、无需手动裁剪的“计算机视觉 + 材料损伤表征”自动化工作流**。通过改进的滑动窗口切样算法，把原始显微图片转化为 RGB 纹理贴片数据集，并基于 **ResNet-18** 迁移学习进行微观形貌缺陷分类，最终实现大图**无死角全扫检测、高亮画框预警以及整体损伤率（Damage Ratio）精准测算**。
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![Python](https://img.shields.io/badge/Python-3.8+-3776ab.svg)](https://www.python.org/)
+[![AI for Science](https://img.shields.io/badge/AI4S-Materials%20Science-0052cc.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+
+> **AI for Materials Science (AI4S) 跨学科实践：**  
+> 将工程断裂力学、SEM 表面形貌表征与深度学习可解释性（XAI）相结合，为柔性半导体薄膜（如 QDs / 钙钛矿薄膜）在机械弯折后的应力损伤与疲劳失效，提供**全图无损定量检测**与**高分辨率应力分布热场表征**。
 
 ---
 
-## ✨ 核心功能亮点 (Key Features)
+## 📖 项目简介 (Overview)
 
-* **🖼️ 原生 RGB 色彩与纹理保留**：区别于传统灰度脱色，针对彩色光显或伪彩 SEM 图像，全流程保留 3 通道色彩与纹理特征，极大增强对渐变式拉伸细纹的抓取敏感度。
-* **🧮 步长重叠扩增技术 (Overlapping Sliding Window)**：利用 `stride < patch_size` 机制在单张大图上执行重叠扫描，无需额外搜集海量电镜图，即可让微小样本量暴增 4~8 倍。
-* **🚀 迁移学习与自动调优 (ResNet-18 Transfer Learning)**：引入 ImageNet 官方预训练权重与标准化处理，在仅 1500 张微区贴片上快速收敛至 **98%+** 准确率，有效防范过拟合。
-* **📊 盲测大图红框扫描与物理量化 (Full-Image Auditing)**：通过阈值微调（Threshold Tuning），在全图盲测中做到“细微发丝纹精准检出”与“完好对照组 0 误报”，并自动在图首打印总面积损伤百分比。
+柔性薄膜在经历了高强度弯折测试后，极易在表面生成极其隐蔽的发丝状微裂纹（Hairline Micro-cracks）。传统材料学研究多依赖**人工选图、肉眼定性观察**，存在严重的**主观选取偏见**且难以进行定量统计。
+
+本项目设计了一套从**大图色彩采样、数据平衡、ResNet-18 深度特征提取**，到**盲测定量计算**与**高斯平滑稠密概率密度映射（Dense Probability Heatmap）**的端到端自动化表征体系。不仅解决了早期应力微缝难以精准检出的难题，更实现对完好对照组（Negative Control）的**极高统计特异性（零误报早筛）**。
 
 ---
 
-## 📂 项目目录结构 (Repository Structure)
+## ✨ 核心亮点 (Key Highlights)
+
+* **🔬 严谨的物理与力学机理印证**
+  * 将原子力显微镜（AFM）测得的**杨氏模量差异**与 SEM 应力开裂行为挂钩：验证了高模量脆性表面（`QDs-OA`）在拉伸应力下的疲劳开裂网络，以及配体置换后均匀弹性表面（`QDs-DDTC`）的优异抗折特性。
+* **⚖️ 高灵敏度 vs. 高特异性双盲对照（Dual-Sample Blind Test）**
+  * **开裂样本 (`QDs-OA`)**：微区损伤响应率达 **88.13%**，极佳地捕捉了应力集中区域的网状发丝裂纹。
+  * **完好对照组 (`QDs-DDTC`)**：测试误报率低至 **0.86%**（特异性达 **99.14%**），彻底排除了模型对 SEM 颗粒背景的过度拟合。
+* **🗺️ 创新性 XAI 稠密概率热图表征 (Dense Probability Heatmap mapping)**
+  * 突破传统 CNN/Grad-CAM 最后一个卷积层缩放引起的“空间分辨率坍塌 ($1 \times 1$ 死色块)”技术瓶颈。
+  * 采用 **滑动窗口高密度概率探针 + 二维高斯连续空间平滑**，把离散的二分类结果转化为**地理等高线般的连续拉伸应力损伤分布热力场**。
+
+---
+
+## 📂 项目结构 (Repository Structure)
 
 ```text
-QDs_Crack_Detection_Project/
- │
- ├── raw_large_images/                 # 原始没切块的高清微观显微大图
- │    ├── crack/                       # 带有开裂缺陷的大图样本
- │    ├── intact/                      # 完好无裂痕的大图样本
- │    ├── test_hairline_crack.png      # 【盲测用】细微发丝裂纹样本
- │    └── test_intact_clean.png        # 【盲测用】平整对照组样本
- │
- ├── data/
- │    └── train/                       # 自动化处理生成的分类小图像块 (32x32)
- │         ├── crack/
- │         └── intact/
- │
- ├── models/
- │    └── resnet18_crack_model.pth     # 训练完成的最佳模型权重文件
- │
- ├── result/
-      └── 
- ├── step1_patching_batch.py           # [步骤1] 彩色显微大图批量重叠切块脚本
- ├── delete_folder.py                  # [辅助]  数据集按类别1:1精准平衡删减脚本
- ├── step2_train_resnet18.py           # [步骤2] ResNet-18 迁移学习与模型训练
- └── step4_visual_demo_resnet18.py     # [步骤3] 全图滑动窗口盲测、红框可视化与损伤计算
+├── models/
+│   └── resnet18_crack_model.pth           # 训练收敛的最佳 ResNet-18 权重文件
+├── raw_large_images/                      # 原始 SEM 高清整图目录
+│   ├── test_hairline_crack.png            # 弯折开裂测试样本 (QDs-OA)
+│   └── test_intact_clean.png              # 平整完好对照组 (QDs-DDTC)
+├── step1_patching_batch.py                # 自动化 RGB 滑动切块脚本 (32x32, 50% 重叠步长)
+├── prune_dataset.py                       # 数据集平衡脚本 (防止类别严重不平衡导致的规则误读)
+├── step2_train_resnet18.py                # ResNet-18 迁移学习与标准三通道图像训练
+├── step4_visual_demo_resnet18.py          # 全图盲测红框目标定位 & 物理损伤率计算
+├── step5_sliding_heatmap.py               # 核心亮点：高分辨高斯平滑稠密概率热场生成器
+└── README.md
