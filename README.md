@@ -56,7 +56,7 @@
 ### 1. 环境配置 (Requirements)
 
 ```bash
-git clone [https://github.com/YourUsername/Flexible-SEM-Crack-Detection.git](https://github.com/YourUsername/Flexible-SEM-Crack-Detection.git)
+git clone [https://github.com/SunnyHanPeach/Flexible-SEM-Crack-Detection.git](https://github.com/SunnyHanPeach/Flexible-SEM-Crack-Detection.git)
 cd Flexible-SEM-Crack-Detection
 pip install torch torchvision opencv-python numpy Pillow
 
