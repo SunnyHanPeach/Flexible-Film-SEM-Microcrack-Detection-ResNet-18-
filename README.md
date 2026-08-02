@@ -47,6 +47,7 @@
 ├── step5_sliding_heatmap.py               # 核心亮点：高分辨高斯平滑稠密概率热场生成器
 └── README.md
 
+---
 ## 快速上手 (Quick Start)
 1. 环境配置 (Requirements)Bashgit clone [https://github.com/YourUsername/Flexible-SEM-Crack-Detection.git](https://github.com/YourUsername/Flexible-SEM-Crack-Detection.git)
 cd Flexible-SEM-Crack-Detection
