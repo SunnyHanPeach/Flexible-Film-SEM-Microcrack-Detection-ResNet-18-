@@ -1,13 +1,3 @@
-# 🚀 同济大学大二上“特长转专业”全栈材料备考手册
-> **背景定位**：同济大学中德工程学院 (CDHK) 机械工程 $\rightarrow$ 材料科学与工程学院  
-> **核心标签**：机械/工程断裂力学 + AI for Science (AI4S) + 柔性半导体微观形貌定量表征  
-> **项目代表作**：Flexible Thin-Film SEM Stress Crack Automated Detection & XAI Characterization
-
----
-
-# Part 1: GitHub 开源仓库完整 README.md
-> *(直接复制以下内容，存为项目根目录的 `README.md`)*
-
 # Flexible Thin-Film SEM Stress Crack Automated Detection & XAI Characterization
 ### 柔性薄膜 SEM 应力裂纹自动化双盲检测与高斯概率热力学表征系统
 
