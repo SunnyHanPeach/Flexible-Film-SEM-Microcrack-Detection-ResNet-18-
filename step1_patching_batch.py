@@ -1,113 +1,138 @@
+"""
+preprocess_patches.py
+Spatial Sub-window Patching & Dataset Preprocessing for SEM Micrographs.
+
+Author: Sun Han
+Description:
+    Extracts overlapping spatial sub-patches (Region of Interest) from raw
+    large-scale SEM micrographs to construct balanced patch-level datasets
+    for convolutional neural network training and validation.
+"""
+
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import cv2
+import argparse
 import glob
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-def slice_large_image_color(img_path, output_dir, label_name, patch_size=32, stride=16):
+def extract_patches_from_image(
+        img_path: str,
+        output_dir: str,
+        category: str,
+        patch_size: int = 32,
+        stride: int = 16,
+) -> int:
     """
-    将单张大型彩色图切为 patch_size x patch_size 的彩色小块
-    保留原图完整的 3 通道 RGB/BGR 色彩信息
+    Extract sub-patches from a single micrograph using a 2D sliding window.
+
+    Args:
+        img_path: Path to the raw SEM image.
+        output_dir: Destination root directory.
+        category: Class label (e.g., 'crack', 'intact').
+        patch_size: Spatial dimensions of the square patch (default: 32).
+        stride: Step size for window displacement (default: 16, 50% overlap).
+
+    Returns:
+        Total number of patches generated.
     """
-    # 1. 默认读取为标准 3 通道彩色图 (B, G, R)
     img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-
     if img is None:
-        print(f"  ❌ 读取失败，跳过文件: {img_path}")
+        print(f"[ERROR] Failed to load image: {img_path}")
         return 0
 
-    # 获取高、宽、通道数
-    h, w, c = img.shape
-    print(f"  --> 正在切片: {os.path.basename(img_path)} | 尺寸: {w}x{h} | 通道数: {c}")
+    h, w, _ = img.shape
+    target_folder = Path(output_dir) / category
+    target_folder.mkdir(parents=True, exist_ok=True)
 
-    # 自动创建对应分类的目标文件夹
-    save_folder = os.path.join(output_dir, label_name)
-    os.makedirs(save_folder, exist_ok=True)
+    stem = Path(img_path).stem
+    patch_count = 0
 
-    count = 0
-    img_name_prefix = os.path.splitext(os.path.basename(img_path))[0]
+    # Vectorized coordinate computation for sliding window grid
+    y_coords = range(0, h - patch_size + 1, stride)
+    x_coords = range(0, w - patch_size + 1, stride)
 
-    # 2. 滑动窗口切块 (Sliding Window Patching)
-    for y in range(0, h - patch_size + 1, stride):
-        for x in range(0, w - patch_size + 1, stride):
-            # 切下 patch_size x patch_size x 3 的彩色彩素块
-            patch = img[y:y + patch_size, x:x + patch_size]
+    for y in y_coords:
+        for x in x_coords:
+            patch = img[y: y + patch_size, x: x + patch_size]
 
-            # 命名格式: 分类名_大图名字_y坐标_x坐标.png
-            patch_filename = f"{label_name}_{img_name_prefix}_y{y}_x{x}.png"
-            patch_filepath = os.path.join(save_folder, patch_filename)
+            # Explicit filename format preserving spatial coordinate metadata
+            filename = f"{category}_{stem}_y{y}_x{x}.png"
+            dest_path = target_folder / filename
 
-            # 3. 保存为彩色 PNG 图
-            cv2.imwrite(patch_filepath, patch)
-            count += 1
+            cv2.imwrite(str(dest_path), patch)
+            patch_count += 1
 
-    print(f"      ✅ 完成！从小图中切出 {count} 张彩色块至 -> {save_folder}")
-    return count
+    return patch_count
 
 
-def batch_process_color_dataset(source_root, target_root, patch_size=32, stride=16):
+def process_category_worker(args_tuple):
+    """Worker function for multi-process batch execution."""
+    img_path, output_dir, category, patch_size, stride = args_tuple
+    return extract_patches_from_image(img_path, output_dir, category, patch_size, stride)
+
+
+def batch_patch_pipeline(
+        source_root: str,
+        target_root: str,
+        patch_size: int = 32,
+        stride: int = 16,
+        num_workers: int = 4,
+):
     """
-    批量处理整个 source_root 目录下的各分类分类大图
-    默认目录结构预期：
-      source_root/
-         ├── crack/     <-- 里面放带裂纹的高清彩色大图
-         └── intact/    <-- 里面放完好无损的高清彩色大图
+    Multiprocess pipeline to traverse raw SEM image directories and generate patches.
     """
-    print("==============================================")
-    print("        彩色高清微观图像切块系统 (RGB Patching)")
-    print("==============================================")
-
-    # 支持的图片后缀
-    valid_exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.PNG", "*.JPG")
-
+    source_path = Path(source_root)
+    valid_exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
     categories = ["crack", "intact"]
-    total_generated = 0
 
-    for category in categories:
-        cat_dir = os.path.join(source_root, category)
-        if not os.path.exists(cat_dir):
-            print(f"【跳过】未见类别目录: {cat_dir}，如果存在单个文件夹请核对名字。")
+    tasks = []
+    print(f"[INFO] Initializing patching pipeline | Patch Size: {patch_size}x{patch_size} | Stride: {stride}")
+
+    for cat in categories:
+        cat_dir = source_path / cat
+        if not cat_dir.is_dir():
+            print(f"[WARN] Category directory not found: {cat_dir}")
             continue
 
-        print(f"\n📁 正在处理类别分类: [{category}] ...")
-
-        # 匹配该分类下所有图片
-        img_files = []
+        img_list = []
         for ext in valid_exts:
-            img_files.extend(glob.glob(os.path.join(cat_dir, ext)))
+            img_list.extend(glob.glob(str(cat_dir / ext)))
 
-        if not img_files:
-            print(f"  ⚠️ 分类 [{category}] 下未发现图片！")
-            continue
+        print(f"[INFO] Found {len(img_list)} images for category '{cat}'")
+        for p in img_list:
+            tasks.append((p, target_root, cat, patch_size, stride))
 
-        for img_path in img_files:
-            num_patches = slice_large_image_color(
-                img_path=img_path,
-                output_dir=target_root,
-                label_name=category,
-                patch_size=patch_size,
-                stride=stride
-            )
-            total_generated += num_patches
+    if not tasks:
+        print("[ERROR] No input images discovered. Aborting pipeline.")
+        return
 
-    print(f"\n🎉 批量切块全流程结束！一共为你生成了 {total_generated} 张彩色小块。")
-    print(f"📁 最终输出路径: {target_root}")
+    # Multiprocess worker pool for rapid I/O and patch extraction
+    total_patches = 0
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_category_worker, t) for t in tasks]
+        for f in as_completed(futures):
+            total_patches += f.result()
+
+    print(f"[SUCCESS] Pipeline complete. Total patches generated: {total_patches}")
+    print(f"[SUCCESS] Dataset stored at: {Path(target_root).resolve()}")
 
 
 if __name__ == "__main__":
-    # ====================================================
-    # 路径配置区域
-    # ====================================================
-    # 1. 存放高清大图的源目录 (请确保里面有 crack 和 intact 两个子文件夹)
-    SOURCE_DIR = "./raw_large_images"
+    parser = argparse.ArgumentParser(description="SEM Micrograph Spatial Patching Utility")
+    parser.add_argument("--source_dir", type=str, default="./raw_large_images", help="Path to raw micrographs")
+    parser.add_argument("--target_dir", type=str, default="./data/train", help="Output directory for patches")
+    parser.add_argument("--patch_size", type=int, default=32, help="Patch dimension (default: 32)")
+    parser.add_argument("--stride", type=int, default=16, help="Sliding window stride (default: 16)")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel processes")
 
-    # 2. 生成后保存小切块的目标目录 (默认输出到 ./data/train)
-    TARGET_DIR = "./data/train"
+    args = parser.parse_args()
 
-    # 3. 运行批量处理
-    batch_process_color_dataset(
-        source_root=SOURCE_DIR,
-        target_root=TARGET_DIR,
-        patch_size=32,  # 小块边长：32x32 像素
-        stride=16  # 滑动步长：16 像素 (50% 重叠采样，增大样本量)
+    batch_patch_pipeline(
+        source_root=args.source_dir,
+        target_root=args.target_dir,
+        patch_size=args.patch_size,
+        stride=args.stride,
+        num_workers=args.workers,
     )
