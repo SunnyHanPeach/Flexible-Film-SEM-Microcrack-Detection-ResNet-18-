@@ -1,132 +1,191 @@
+"""
+eval_blind_detection.py
+High-Throughput Full-Field Microcrack Blind Detection and Damage Quantification.
+
+Author: Sun Han
+Description:
+    Performs batch-accelerated sliding window inference on large-scale SEM micrographs.
+    Quantifies surface micro-damage ratio and localizes stress-induced crack clusters
+    using deep residual feature representations with high statistical specificity.
+"""
+
 import os
+import argparse
+import time
+from pathlib import Path
+from typing import Tuple, List
+
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import transforms, models
-from PIL import Image
-
-# ==========================================
-# 1. 消除 Windows DLL 冲突 & 搭建与 step2 一致的 ResNet-18
-# ==========================================
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from torchvision import models, transforms
 
 
-def get_resnet18_model(device):
-    """
-    搭建与训练脚本完全同步的 ResNet-18 二分类网络结构
-    """
-    model = models.resnet18(weights=None)  # 仅加载网络结构，权重用我们自己训好的
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, 2)  # 2 分类: 0-crack, 1-intact
-    return model.to(device)
+def build_inference_model(model_path: str, device: torch.device, num_classes: int = 2) -> nn.Module:
+    """Initialize model architecture and load trained state dictionary."""
+    model = models.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
 
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"[ERROR] Model checkpoint not found at: {model_path}")
 
-# ==========================================
-# 2. 全图滑动扫描检测主逻辑 (支持 RGB 彩色)
-# ==========================================
-def detect_cracks_resnet18(model_path, image_path, output_path, patch_size=32, stride=16, conf_threshold=0.70):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 自动校验模型是否存在
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"❌ 找不到模型权重: {model_path}，请确认 step2 训练完毕且路径正确！")
-
-    model = get_resnet18_model(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.to(device)
     model.eval()
+    return model
 
-    # 校验测试图片是否存在
-    if not os.path.exists(image_path):
-        print(f"【跳过】找不到待测图: {image_path}，请检查路径。")
+
+class PatchInferenceEngine:
+    """
+    High-performance batched inference pipeline for spatial scanning across large FOV.
+    """
+
+    def __init__(self, model: nn.Module, device: torch.device, batch_size: int = 64):
+        self.model = model
+        self.device = device
+        self.batch_size = batch_size
+
+        # Standard ImageNet normalization parameters matching training pipeline
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+
+    def process_batch(self, batch_tensors: List[torch.Tensor]) -> np.ndarray:
+        """Run batched forward pass and return crack probabilities."""
+        # Concatenate into (B, 3, H, W)
+        x = torch.stack(batch_tensors, dim=0).to(self.device)
+        x = (x / 255.0 - self.mean) / self.std
+
+        with torch.no_grad():
+            logits = self.model(x)
+            probs = torch.softmax(logits, dim=1)
+            # Class 0 corresponds to 'crack'
+            crack_probs = probs[:, 0].cpu().numpy()
+
+        return crack_probs
+
+
+def run_blind_detection(
+        image_path: str,
+        model_path: str,
+        output_path: str,
+        patch_size: int = 32,
+        stride: int = 16,
+        conf_threshold: float = 0.80,
+        batch_size: int = 64,
+) -> Tuple[int, float]:
+    """
+    Execute full-micrograph sliding scan with batched tensor streaming.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_inference_model(model_path, device)
+    engine = PatchInferenceEngine(model, device, batch_size=batch_size)
+
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        print(f"[ERROR] Failed to read image from {image_path}")
         return 0, 0.0
 
-    # 1. 以彩色 3 通道形式读取原始大图 (BGR)
-    original_img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    h, w, _ = original_img.shape
+    h, w, _ = img.shape
+    stem = Path(image_path).name
+    print(f"[INFO] Scanning micrograph: {stem} | Dimensions: {w}x{h} | Device: {device.type}")
 
-    # 2. 严格对齐 step2 训练时的彩色转换管道 (必须保持一模一样)
-    transform = transforms.Compose([
-        transforms.Resize((patch_size, patch_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    t0 = time.time()
 
-    crack_boxes = []
-    total_patches = 0
+    # Pre-collect coordinates to construct sliding-window grid
+    y_steps = list(range(0, h - patch_size + 1, stride))
+    x_steps = list(range(0, w - patch_size + 1, stride))
+    total_patches = len(y_steps) * len(x_steps)
 
-    print(f"\n--> [ResNet-18] 正在高精度扫描: {os.path.basename(image_path)} (尺寸: {w}x{h}) ...")
+    batch_tensors = []
+    batch_coords = []
+    positive_boxes = []
 
-    # 3. 滑动窗口抓取切块
-    for y in range(0, h - patch_size + 1, stride):
-        for x in range(0, w - patch_size + 1, stride):
-            total_patches += 1
-            patch_bgr = original_img[y:y + patch_size, x:x + patch_size]
-
-            # OpenCV (BGR) 转 PIL (RGB) 以供 torchvision 能够正确处理颜色
+    # Stream patches through batch pipeline
+    for y in y_steps:
+        for x in x_steps:
+            patch_bgr = img[y: y + patch_size, x: x + patch_size]
+            # Convert BGR (OpenCV) -> RGB and permute to (3, H, W)
             patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
-            pil_patch = Image.fromarray(patch_rgb)
-            tensor_patch = transform(pil_patch).unsqueeze(0).to(device)
+            patch_t = torch.from_numpy(patch_rgb).permute(2, 0, 1).float()
 
-            with torch.no_grad():
-                outputs = model(tensor_patch)
-                probs = torch.softmax(outputs, dim=1)
+            batch_tensors.append(patch_t)
+            batch_coords.append((x, y))
 
-                # 注意：假设 DataLoader 自动映射字典为 {'crack': 0, 'intact': 1}
-                # 如果发现全部框错，把 0 改为 1 即可 (probs[0, 1].item())
-                crack_prob = probs[0, 0].item()
+            if len(batch_tensors) >= batch_size:
+                probs = engine.process_batch(batch_tensors)
+                for (cx, cy), p in zip(batch_coords, probs):
+                    if p >= conf_threshold:
+                        positive_boxes.append((cx, cy, cx + patch_size, cy + patch_size))
+                batch_tensors.clear()
+                batch_coords.clear()
 
-                if crack_prob > conf_threshold:
-                    crack_boxes.append((x, y, x + patch_size, y + patch_size))
+    # Flush remaining patches in buffer
+    if batch_tensors:
+        probs = engine.process_batch(batch_tensors)
+        for (cx, cy), p in zip(batch_coords, probs):
+            if p >= conf_threshold:
+                positive_boxes.append((cx, cy, cx + patch_size, cy + patch_size))
 
-    # 4. 在原图上标记红色警示框 (BGR中红色的代号为 0, 0, 255)
-    result_img = original_img.copy()
-    for (x1, y1, x2, y2) in crack_boxes:
-        cv2.rectangle(result_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
+    elapsed = time.time() - t0
+    damage_ratio = (len(positive_boxes) / total_patches) * 100.0 if total_patches > 0 else 0.0
 
-    damage_ratio = (len(crack_boxes) / total_patches) * 100 if total_patches > 0 else 0.0
+    # Annotate spatial bounding boxes and diagnostic statistics
+    annotated_img = img.copy()
+    for x1, y1, x2, y2 in positive_boxes:
+        cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
 
-    # 顶部添加标注水印
-    info_text = f"ResNet18 | Damage: {damage_ratio:.2f}% | Conf > {conf_threshold}"
-    cv2.putText(result_img, info_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    label_text = f"Damage Ratio: {damage_ratio:.2f}% | Conf >= {conf_threshold} | {stem}"
+    cv2.putText(annotated_img, label_text, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    cv2.imwrite(output_path, result_img)
-    print(f"  ✅ 扫描完毕！遍历微区: {total_patches} 个 | 锁定了 {len(crack_boxes)} 个微裂纹框")
-    print(f"  ✅ 物理损伤率估算: {damage_ratio:.2f}% -> 效果图已生成: {output_path}")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(output_path, annotated_img)
 
-    return len(crack_boxes), damage_ratio
+    print(f"[RESULT] Patches Evaluated: {total_patches} | Detections: {len(positive_boxes)}")
+    print(
+        f"[RESULT] Damage Ratio: {damage_ratio:.2f}% | Time Elapsed: {elapsed:.2f}s ({total_patches / elapsed:.1f} fps)")
+    print(f"[OUTPUT] Visualization saved to: {output_path}")
+
+    return len(positive_boxes), damage_ratio
 
 
 if __name__ == "__main__":
-    # ==========================================================
-    # 参数配置区：优先使用你刚刚训练好的 ResNet-18 权重
-    # ==========================================================
-    MODEL_FILE = "./resnet18_crack_model.pth"
+    parser = argparse.ArgumentParser(description="SEM Microcrack Dual-Blind Detection Benchmark")
+    parser.add_argument("--model_path", type=str, default="./models/resnet18_crack_model.pth", help="Trained weights")
+    parser.add_argument("--crack_image", type=str, default="./raw_large_images/test_hairline_crack.png",
+                        help="Damaged SEM sample")
+    parser.add_argument("--control_image", type=str, default="./raw_large_images/test_intact_clean.png",
+                        help="Intact control sample")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Directory for output visualizations")
+    parser.add_argument("--conf_thresh", type=float, default=0.80, help="Damage confidence threshold")
+    parser.add_argument("--batch_size", type=int, default=64, help="Inference batch size")
 
-    # 兼容提醒：如果找不到 resnet18 权重，提醒用户去跑 step2
-    if not os.path.exists(MODEL_FILE):
-        print(f"⚠️ 未检测到 {MODEL_FILE}，请确认你已经运行过 step2_train_resnet18.py！")
+    args = parser.parse_args()
 
-    print("==========================================================")
-    print("      ResNet-18 柔性薄膜 SEM 显微形貌损伤智能盲测系统        ")
-    print("==========================================================")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 任务 1：高精度扫描“细微发丝微裂纹”样本 (QDs-OA after bending)
-    detect_cracks_resnet18(
-        model_path=MODEL_FILE,
-        image_path="./raw_large_images/test_hairline_crack.png",
-        output_path="./result_resnet18_hairline_crack.png",
-        conf_threshold=0.70
+    print("=" * 65)
+    print("   Quantitative Stress Microcrack Screening Pipeline (Batch Mode)")
+    print("=" * 65)
+
+    # Benchmark Test 1: Bending-induced crack network (QDs-OA)
+    run_blind_detection(
+        image_path=args.crack_image,
+        model_path=args.model_path,
+        output_path=str(out_dir / "eval_crack_damaged.png"),
+        conf_threshold=args.conf_thresh,
+        batch_size=args.batch_size,
     )
 
-    # 任务 2：高精度扫描“平整完好对照组”样本 (QDs-DDTC after bending)
-    detect_cracks_resnet18(
-        model_path=MODEL_FILE,
-        image_path="./raw_large_images/test_intact_clean.png",
-        output_path="./result_resnet18_intact_control.png",
-        conf_threshold=0.70
-    )
+    print("-" * 65)
 
-    print("\n🎉 自动化双盲检测全部结束！快打开根目录查看生成的 result_resnet18_*.png 对比图！")
+    # Benchmark Test 2: Mechanically robust negative control (QDs-DDTC)
+    run_blind_detection(
+        image_path=args.control_image,
+        model_path=args.model_path,
+        output_path=str(out_dir / "eval_control_intact.png"),
+        conf_threshold=args.conf_thresh,
+        batch_size=args.batch_size,
+    )
