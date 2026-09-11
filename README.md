@@ -1,4 +1,3 @@
-```markdown
 # Quantitative Characterization of Stress Microcracks in Flexible Thin Films via ResNet-18 and Continuous Spatial Probability Modeling
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
