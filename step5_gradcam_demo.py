@@ -1,155 +1,230 @@
+"""
+generate_stress_heatmap.py
+Dense Spatial Probability Mapping & Gaussian Continuous Stress Field Characterization.
+
+Author: Sun Han
+Description:
+    Implements a dense sliding-window probability probe combined with separable 2D
+    Gaussian continuous smoothing to circumvent Grad-CAM spatial resolution collapse.
+    Maps discrete CNN classifications into a continuous damage probability field for
+    flexible semiconductor thin films under mechanical fatigue.
+"""
+
 import os
+import argparse
+import time
+from pathlib import Path
+from typing import Tuple
+
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from torchvision import transforms, models
-from PIL import Image
-
-# 1. 消除 Windows 环境变量 DLL 冲突
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from torchvision import models
 
 
-# =========================================================
-# 2. 搭建与训练阶段相吻合的 ResNet-18 模型结构
-# =========================================================
-def get_resnet18_model(device, num_classes=2):
+def load_feature_extractor(model_path: str, device: torch.device, num_classes: int = 2) -> nn.Module:
+    """Instantiate ResNet-18 architecture and load fine-tuned weights."""
     model = models.resnet18(weights=None)
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
-    return model.to(device)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"[ERROR] Checkpoint not found: {model_path}")
+
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    model.eval()
+    return model
 
 
-# =========================================================
-# 3. 核心：稠密概率滑动窗口 + 高斯平滑热力图生成器
-# =========================================================
-def generate_dense_heatmap(model, image_path, output_path,
-                           patch_size=32, stride=8, batch_size=64,
-                           gaussian_kernel=31, crack_class_idx=0):
+def apply_separable_gaussian_smoothing(
+        prob_field: np.ndarray,
+        kernel_size: int = 31,
+        sigma: float = 0.0
+) -> np.ndarray:
     """
-    通过滑动窗口密采各区域开裂概率，并用高斯滤波平滑生成工业级热力图
+    Apply 2D Gaussian spatial smoothing utilizing separable 1D kernels.
+    Complexity: Reduces computation from O(H * W * K^2) to O(H * W * 2K).
+    """
+    # cv2.GaussianBlur internally optimizes via separable 1D row-column passes
+    return cv2.GaussianBlur(prob_field, (kernel_size, kernel_size), sigmaX=sigma, sigmaY=sigma)
+
+
+def render_colorbar(height: int, width: int = 40) -> np.ndarray:
+    """Generate a vertical JET colormap calibration bar (0.0 to 1.0)."""
+    gradient = np.linspace(255, 0, height, dtype=np.uint8).reshape(-1, 1)
+    gradient = np.repeat(gradient, width, axis=1)
+    colorbar = cv2.applyColorMap(gradient, cv2.COLORMAP_JET)
+
+    # Add scalar tick marks
+    cv2.putText(colorbar, "1.0", (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(colorbar, "0.5", (4, height // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(colorbar, "0.0", (4, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return colorbar
+
+
+def generate_stress_field_heatmap(
+        image_path: str,
+        model_path: str,
+        output_path: str,
+        patch_size: int = 32,
+        stride: int = 8,
+        batch_size: int = 64,
+        gaussian_kernel: int = 31,
+        crack_class_idx: int = 0,
+        absolute_scale: bool = True
+) -> np.ndarray:
+    """
+    Execute dense sliding-window probe across SEM FOV and project continuous stress damage field.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
+    model = load_feature_extractor(model_path, device)
 
-    # 1. 读取原生大图 (BGR -> RGB)
-    original_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if original_bgr is None:
-        raise FileNotFoundError(f"❌ 无法读取图像: {image_path}")
+    img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise FileNotFoundError(f"[ERROR] Failed to load image from: {image_path}")
 
-    h, w, _ = original_bgr.shape
-    original_rgb = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+    h, w, _ = img_bgr.shape
+    stem = Path(image_path).name
+    print(f"[INFO] Processing SEM Micrograph: {stem} | Resolution: {w}x{h} | Stride: {stride}")
 
-    # 2. 构建数据标准化预处理管道
-    transform = transforms.Compose([
-        transforms.Resize((patch_size, patch_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # Coordinate grid generation
+    y_coords = list(range(0, h - patch_size + 1, stride))
+    x_coords = list(range(0, w - patch_size + 1, stride))
+    total_probes = len(y_coords) * len(x_coords)
+    print(f"[INFO] Dense Probing Grid: {total_probes} patches | Batch Size: {batch_size}")
 
-    # 3. 初始化概率矩阵与计数矩阵（用于处理窗口重叠区域的求均值）
-    prob_map = np.zeros((h, w), dtype=np.float32)
-    count_map = np.zeros((h, w), dtype=np.float32)
+    # Accumulation buffers for spatial probability estimation
+    prob_accumulator = np.zeros((h, w), dtype=np.float32)
+    weight_accumulator = np.zeros((h, w), dtype=np.float32)
 
-    # 4. 收集所有扫描坐标并使用 Batch 批量推理，大幅提升速度
-    coords = []
-    for y in range(0, h - patch_size + 1, stride):
-        for x in range(0, w - patch_size + 1, stride):
-            coords.append((x, y))
+    # ImageNet normalization tensors for vector broadcasting
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1).to(device)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1).to(device)
 
-    print(f"\n--> 正在进行稠密滑动概率扫描: {os.path.basename(image_path)}")
-    print(f"    图像尺寸: {w}x{h} | 采样窗口: {patch_size}x{patch_size} | 步长: {stride}")
-    print(f"    总采样微区数: {len(coords)} -> 采用 Batch size = {batch_size} 并行加速...")
+    t0 = time.time()
+    batch_patches = []
+    batch_coords = []
 
-    for i in range(0, len(coords), batch_size):
-        batch_coords = coords[i:i + batch_size]
-        batch_tensors = []
+    # Stream dense sliding-window patches
+    for y in y_coords:
+        for x in x_coords:
+            patch = img_bgr[y: y + patch_size, x: x + patch_size]
+            # Convert BGR -> RGB and transfrom to (3, H, W)
+            patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+            patch_tensor = torch.from_numpy(patch_rgb).permute(2, 0, 1).float()
 
-        for (x, y) in batch_coords:
-            patch_rgb = original_rgb[y:y + patch_size, x:x + patch_size]
-            patch_pil = Image.fromarray(patch_rgb)
-            batch_tensors.append(transform(patch_pil))
+            batch_patches.append(patch_tensor)
+            batch_coords.append((x, y))
 
-        # 打包堆叠为 Batch Tensor [B, 3, 32, 32]
-        input_batch = torch.stack(batch_tensors, dim=0).to(device)
+            if len(batch_patches) >= batch_size:
+                # Forward pass
+                x_in = torch.stack(batch_patches, dim=0).to(device)
+                x_in = (x_in / 255.0 - mean) / std
+                with torch.no_grad():
+                    logits = model(x_in)
+                    probs = torch.softmax(logits, dim=1)[:, crack_class_idx].cpu().numpy()
 
+                for (bx, by), p in zip(batch_coords, probs):
+                    prob_accumulator[by: by + patch_size, bx: bx + patch_size] += p
+                    weight_accumulator[by: by + patch_size, bx: bx + patch_size] += 1.0
+
+                batch_patches.clear()
+                batch_coords.clear()
+
+    # Flush remaining tail batch
+    if batch_patches:
+        x_in = torch.stack(batch_patches, dim=0).to(device)
+        x_in = (x_in / 255.0 - mean) / std
         with torch.no_grad():
-            outputs = model(input_batch)
-            probs = torch.softmax(outputs, dim=1)
-            # 获取当前 Batch 内所有窗口的开裂缺陷 (crack) 预测概率
-            crack_probs = probs[:, crack_class_idx].cpu().numpy()
+            logits = model(x_in)
+            probs = torch.softmax(logits, dim=1)[:, crack_class_idx].cpu().numpy()
 
-        # 将概率累加到对应坐标系空间中
-        for idx, (x, y) in enumerate(batch_coords):
-            prob_map[y:y + patch_size, x:x + patch_size] += crack_probs[idx]
-            count_map[y:y + patch_size, x:x + patch_size] += 1.0
+        for (bx, by), p in zip(batch_coords, probs):
+            prob_accumulator[by: by + patch_size, bx: bx + patch_size] += p
+            weight_accumulator[by: by + patch_size, bx: bx + patch_size] += 1.0
 
-    # 5. 求出所有重叠区域的真实概率均值
-    count_map = np.maximum(count_map, 1.0)
-    avg_prob_map = prob_map / count_map
+    # Unbiased empirical expectation: P_avg(x, y)
+    weight_accumulator = np.maximum(weight_accumulator, 1.0)
+    raw_prob_field = prob_accumulator / weight_accumulator
 
-    # 6. 【核心美化】二维高斯空间平滑 (Gaussian Smoothing)
-    # 彻底抹平微区边界方块感，生成连续自然的等高线应力热场
-    print("--> 正在执行二维高斯空间平滑处理...")
-    smoothed_prob_map = cv2.GaussianBlur(avg_prob_map, (gaussian_kernel, gaussian_kernel), 0)
+    # Perform continuous space smoothing
+    smoothed_field = apply_separable_gaussian_smoothing(raw_prob_field, kernel_size=gaussian_kernel)
 
-    # 7. 动态对比度归一化至 [0, 1] 区间以便伪彩渲染
-    min_val, max_val = smoothed_prob_map.min(), smoothed_prob_map.max()
-    if max_val > min_val:
-        norm_map = (smoothed_prob_map - min_val) / (max_val - min_val)
+    # Scientific Intensity Calibration:
+    # Use absolute [0, 1] range to avoid artificially exaggerating noise in pristine control samples.
+    if absolute_scale:
+        calibrated_field = np.clip(smoothed_field, 0.0, 1.0)
     else:
-        norm_map = np.zeros_like(smoothed_prob_map)
+        p_min, p_max = smoothed_field.min(), smoothed_field.max()
+        calibrated_field = (smoothed_field - p_min) / (p_max - p_min + 1e-8)
 
-    # 8. 上色与多视图融合
-    heatmap_uint8 = np.uint8(255 * norm_map)
+    peak_prob = float(smoothed_field.max())
+    mean_prob = float(smoothed_field.mean())
+
+    # Multi-view composite rendering
+    heatmap_uint8 = np.uint8(255 * calibrated_field)
     colored_heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 按照 55% 原图 + 45% 热场的黄金叠加比合成
-    superimposed_img = cv2.addWeighted(original_bgr, 0.55, colored_heatmap, 0.45, 0)
+    # Blend original morphology (55%) with stress probability field (45%)
+    overlay = cv2.addWeighted(img_bgr, 0.55, colored_heatmap, 0.45, 0)
 
-    # 9. 拼接对照大图 (左: 原始 SEM 形貌 | 中: 连续概率热场 | 右: 叠加定位诊断图)
-    combined_result = np.hstack([original_bgr, colored_heatmap, superimposed_img])
+    # Attach vertical radiometric calibration scale
+    cbar = render_colorbar(height=h, width=35)
+    margin = np.zeros((h, 10, 3), dtype=np.uint8)
 
-    # 水印抬头
-    title = f"Dense Probability Heatmap (ResNet-18) | Max Crack Prob: {max_val:.2%}"
-    cv2.putText(combined_result, title, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    # Triptych arrangement: Raw SEM | Continuous Stress Field | Superimposed XAI Diagnostic
+    panel = np.hstack([img_bgr, margin, colored_heatmap, margin, overlay, margin, cbar])
 
-    cv2.imwrite(output_path, combined_result)
-    print(f"✅ 高清连续概率热力图已完美生成！保存路径: {output_path}")
+    elapsed = time.time() - t0
+    header_text = f"XAI Continuous Stress Field | Peak Damage Prob: {peak_prob:.2%} | Mean: {mean_prob:.2%}"
+    cv2.putText(panel, header_text, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
-    return norm_map
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(output_path, panel)
+
+    print(f"[SUCCESS] Heatmap generated in {elapsed:.2f}s | Peak: {peak_prob:.2%} | Output: {output_path}")
+    return calibrated_field
 
 
 if __name__ == "__main__":
-    MODEL_FILE = "./model/resnet18_crack_model.pth"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(description="Dense Continuous Probability Field Generator for SEM Microcracks")
+    parser.add_argument("--model_path", type=str, default="./models/resnet18_crack_model.pth",
+                        help="Model weights path")
+    parser.add_argument("--crack_image", type=str, default="./raw_large_images/test_hairline_crack.png",
+                        help="Bending crack sample")
+    parser.add_argument("--control_image", type=str, default="./raw_large_images/test_intact_clean.png",
+                        help="Intact control sample")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Directory for diagnostic heatmaps")
+    parser.add_argument("--stride", type=int, default=8, help="Dense probing step size (default: 8)")
+    parser.add_argument("--kernel_size", type=int, default=31, help="Gaussian smoothing kernel size (odd integer)")
 
-    # 初始化并载入训练好的 ResNet-18 权重
-    model = get_resnet18_model(device=device)
-    if not os.path.exists(MODEL_FILE):
-        raise FileNotFoundError(f"❌ 找不到模型权重: {MODEL_FILE}，请先执行 step2_train_resnet18.py。")
-    model.load_state_dict(torch.load(MODEL_FILE, map_location=device))
+    args = parser.parse_args()
 
-    print("==========================================================")
-    print("      柔性薄膜微观应力损伤 - 稠密概率分布热图生成系统      ")
-    print("==========================================================")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 任务 1：测试带细微发丝纹的开裂样本 (高概率高温带将精确沿着纹路展开)
-    generate_dense_heatmap(
-        model=model,
-        image_path="./raw_large_images/test_hairline_crack.png",
-        output_path="./result_dense_heatmap_crack.png",
-        patch_size=32,
-        stride=8,  # 步长越小，等高线越精细，推荐 4 或 8
-        gaussian_kernel=31  # 高斯核一定要是奇数，推荐 31 或 45
+    print("=" * 70)
+    print("   Continuous Mechanical Stress Field Reconstruction via Dense Probing")
+    print("=" * 70)
+
+    # 1. Evaluate Bending Microcrack Sample (High Stress Concentration Zone)
+    generate_stress_field_heatmap(
+        image_path=args.crack_image,
+        model_path=args.model_path,
+        output_path=str(out_dir / "heatmap_dense_crack_field.png"),
+        stride=args.stride,
+        gaussian_kernel=args.kernel_size,
     )
 
-    # 任务 2：测试完好平整对照组 (全图应当沉寂在冷蓝色海洋中)
-    generate_dense_heatmap(
-        model=model,
-        image_path="./raw_large_images/test_intact_clean.png",
-        output_path="./result_dense_heatmap_intact.png",
-        patch_size=32,
-        stride=8,
-        gaussian_kernel=31
+    print("-" * 70)
+
+    # 2. Evaluate Intact Negative Control (Robustness & Specificity Verification)
+    generate_stress_field_heatmap(
+        image_path=args.control_image,
+        model_path=args.model_path,
+        output_path=str(out_dir / "heatmap_dense_control_field.png"),
+        stride=args.stride,
+        gaussian_kernel=args.kernel_size,
     )
