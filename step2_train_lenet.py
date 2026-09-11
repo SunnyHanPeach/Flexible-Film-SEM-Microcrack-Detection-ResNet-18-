@@ -1,121 +1,243 @@
+"""
+train_feature_extractor.py
+Transfer Learning & Fine-tuning Pipeline for SEM Microcrack Classification.
+
+Author: Sun Han
+Description:
+    Fine-tunes a deep residual network (ResNet-18) on localized SEM micro-patches.
+    Incorporates spatial invariant data augmentation, cosine annealing learning rate
+    scheduling, and validation tracking (Accuracy, Recall, F1-score) to achieve
+    robust feature extraction without overfitting to substrate morphology.
+"""
+
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import argparse
+import random
+from pathlib import Path
+from typing import Tuple, Dict
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, models
 
 
-# ==========================================
-# 1. 构建 ResNet-18 迁移学习二分类模型
-# ==========================================
-def get_resnet18_model(device):
-    """
-    自动下载官方 ImageNet 预训练权重，并将其微调为 2 分类模型
-    """
-    print("--> 正在加载 ResNet-18 官方预训练权重...")
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+def set_seed(seed: int = 42) -> None:
+    """Enforce strict deterministic behavior across runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-    # 获取最后一层全连接层原来的输入维度 (ResNet-18 是 512)
+
+def build_resnet18_classifier(num_classes: int = 2, pretrained: bool = True) -> nn.Module:
+    """
+    Construct ResNet-18 transfer learning backbone with custom classification head.
+    """
+    weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+    model = models.resnet18(weights=weights)
+
     in_features = model.fc.in_features
+    # Replace final fully connected layer for binary discrimination
+    model.fc = nn.Sequential(
+        nn.Dropout(p=0.2),
+        nn.Linear(in_features, num_classes)
+    )
+    return model
 
-    # 将 ImageNet 的 1000 分类替换为我们的 2 分类 (0: crack, 1: intact)
-    model.fc = nn.Linear(in_features, 2)
 
-    return model.to(device)
-
-
-# ==========================================
-# 2. 彩色图数据增强与加载 (保留 RGB 3通道)
-# ==========================================
-def get_dataloader(data_dir, batch_size=16):
+def prepare_datasets(
+        data_dir: str,
+        val_ratio: float = 0.2,
+        seed: int = 42
+) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
     """
-    针对彩色图像的增强管道：
-    去除了 Grayscale，直接利用 3 通道及 ImageNet 标准统计量归一化
+    Load patch dataset with spatial data augmentation and stratified train/val split.
     """
-    train_transform = transforms.Compose([
-        transforms.Resize((32, 32)),  # 统一切块大小
-        transforms.RandomHorizontalFlip(p=0.5),  # 随机水平翻转
-        transforms.RandomVerticalFlip(p=0.5),  # 随机垂直翻转
-        transforms.RandomRotation(90),  # 随机旋转（对裂纹方向极其重要）
-        transforms.ToTensor(),  # 自动转为 [3, H, W] 浮点张量
-        # 使用官方预训练模型对应的 ImageNet 3 通道均值与方差
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
+    data_path = Path(data_dir)
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"[ERROR] Dataset root not found at: {data_path.resolve()}")
+
+    # Geometric augmentations invariant to physical crack orientation
+    train_transforms = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=90),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"❌ 找不到数据目录: {data_dir}，请确保路径正确！")
+    val_transforms = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
-    dataset = datasets.ImageFolder(root=data_dir, transform=train_transform)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Base dataset for indexing
+    full_dataset = datasets.ImageFolder(root=str(data_path))
+    class_to_idx = full_dataset.class_to_idx
 
-    return loader, dataset.class_to_idx
+    val_size = int(len(full_dataset) * val_ratio)
+    train_size = len(full_dataset) - val_size
+
+    generator = torch.Generator().manual_seed(seed)
+    train_subset, val_subset = random_split(full_dataset, [train_size, val_size], generator=generator)
+
+    # Re-apply appropriate transforms to respective subsets
+    train_subset.dataset.transform = train_transforms
+    val_subset.dataset.transform = val_transforms
+
+    return train_subset, val_subset, class_to_idx
 
 
-# ==========================================
-# 3. 训练主流程
-# ==========================================
-def train_model():
-    # 检测计算设备
+def compute_binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute classification metrics focusing on damage detection performance."""
+    tp = np.sum((y_true == 0) & (y_pred == 0))
+    fp = np.sum((y_true == 1) & (y_pred == 0))
+    fn = np.sum((y_true == 0) & (y_pred == 1))
+    tn = np.sum((y_true == 1) & (y_pred == 1))
+
+    acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+    return {
+        "accuracy": float(acc * 100.0),
+        "precision": float(precision * 100.0),
+        "recall": float(recall * 100.0),
+        "f1": float(f1 * 100.0),
+    }
+
+
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device):
+    """Evaluate model on validation subset."""
+    model.eval()
+    running_loss = 0.0
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+
+    total_samples = len(loader.dataset)
+    epoch_loss = running_loss / total_samples
+    metrics = compute_binary_metrics(np.array(all_targets), np.array(all_preds))
+    metrics["loss"] = epoch_loss
+    return metrics
+
+
+def train_pipeline(
+        data_dir: str,
+        output_dir: str,
+        epochs: int = 20,
+        batch_size: int = 32,
+        lr: float = 3e-4,
+        weight_decay: float = 1e-4,
+        seed: int = 42
+):
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"==============================================")
-    print(f"   启动 ResNet-18 彩色微裂纹分类训练")
-    print(f"   计算设备: {device}")
-    print(f"==============================================")
 
-    # 加载数据集 (确认你保存小图的根目录为 ./data/train)
-    train_dir = "./data/train"
-    train_loader, class_idx = get_dataloader(train_dir, batch_size=16)
-    print(f"✅ 成功加载数据集！标签对应索引: {class_idx}")
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    # 初始化模型、损失函数与优化器
-    model = get_resnet18_model(device)
+    print("=" * 70)
+    print("      ResNet-18 Transfer Learning for SEM Microcrack Characterization")
+    print(f"      Device: {device} | Random Seed: {seed}")
+    print("=" * 70)
+
+    train_subset, val_subset, class_to_idx = prepare_datasets(data_dir, val_ratio=0.2, seed=seed)
+    print(f"[DATA] Class Mapping: {class_to_idx}")
+    print(f"[DATA] Training Set: {len(train_subset)} patches | Validation Set: {len(val_subset)} patches")
+
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    model = build_resnet18_classifier(num_classes=2, pretrained=True).to(device)
     criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    # 迁移学习技巧：学习率稍小一点(0.0005)，避免破坏预训练特征
-    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    best_val_f1 = 0.0
+    best_epoch = 0
+    save_file = out_path / "resnet18_crack_model.pth"
 
-    epochs = 20
-    best_acc = 0.0
-    save_path = "resnet18_crack_model.pth"
-
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        train_loss = 0.0
 
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            train_loss += loss.item() * inputs.size(0)
 
-        acc = 100.0 * correct / total
-        avg_loss = total_loss / len(train_loader)
+        scheduler.step()
+        epoch_train_loss = train_loss / len(train_subset)
 
-        print(f"Epoch [{epoch + 1:02d}/{epochs}] - Loss: {avg_loss:.4f} - 准确率: {acc:.2f}%")
+        # Validation Step
+        val_metrics = evaluate(model, val_loader, criterion, device)
 
-        # 始终保存训练过程中准确率最高的模型权重
-        if acc >= best_acc:
-            best_acc = acc
-            torch.save(model.state_dict(), save_path)
+        print(
+            f"Epoch [{epoch:02d}/{epochs:02d}] "
+            f"| Train Loss: {epoch_train_loss:.4f} "
+            f"| Val Loss: {val_metrics['loss']:.4f} "
+            f"| Val Acc: {val_metrics['accuracy']:.2f}% "
+            f"| Recall: {val_metrics['recall']:.2f}% "
+            f"| F1: {val_metrics['f1']:.2f}%"
+        )
 
-    print(f"\n🎉 训练全部完成！最高准确率达到: {best_acc:.2f}%")
-    print(f"✅ 最佳模型权重已保存至当前目录: {save_path}")
+        # Checkpoint optimal weights based on Validation F1-score (critical for crack recall)
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
+            best_epoch = epoch
+            # Save state dict
+            torch.save(model.state_dict(), save_file)
+
+    print("-" * 70)
+    print(f"[SUMMARY] Best Validation F1-Score: {best_val_f1:.2f}% at Epoch {best_epoch}")
+    print(f"[SUCCESS] Checkpoint saved successfully to: {save_file.resolve()}")
 
 
 if __name__ == "__main__":
-    train_model()
+    parser = argparse.ArgumentParser(description="ResNet-18 Microcrack Transfer Learning Pipeline")
+    parser.add_argument("--data_dir", type=str, default="./data/train", help="Root directory for patch dataset")
+    parser.add_argument("--output_dir", type=str, default="./models", help="Directory to save model weights")
+    parser.add_argument("--epochs", type=int, default=20, help="Total training epochs")
+    parser.add_argument("--batch_size", type=int, default=32, help="Mini-batch size")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
+
+    args = parser.parse_args()
+
+    train_pipeline(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        seed=args.seed
+    )
